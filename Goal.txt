@@ -1,0 +1,297 @@
+⚠️ WARNING: This will DESTROY ALL DATA on your /boot partition!
+#!/bin/bash
+
+========================
+CONFIGURATION VARIABLES
+========================
+BACKUP_DIR="/root/boot_backup_$(date +%Y%m%d_%H%M%S)"
+BOOT_PART="/dev/sda1" # Change this to your actual boot partition
+ROOT_PART="/dev/sda2" # Change this to your actual root partition
+
+========================
+PREFLIGHT CHECKS
+========================
+echo "=== Arch Linux systemd-boot Installation ==="
+echo "⚠️ WARNING: This will DESTROY your /boot partition!"
+echo
+
+Check root
+if [ "$EUID" -ne 0 ]; then
+echo "This script must be run as root"
+exit 1
+fi
+
+Check if we're on Arch Linux
+if ! command -v pacman >/dev/null 2>&1; then
+echo "This script is for Arch Linux only!"
+exit 1
+fi
+
+Verify boot partition
+if [ ! -b "$BOOT_PART" ]; then
+echo "Boot partition $BOOT_PART not found!"
+echo "Detected block devices:"
+lsblk -o NAME,SIZE,TYPE,MOUNTPOINT
+echo "Please set BOOT_PART variable correctly"
+exit 1
+fi
+
+========================
+BACKUP PHASE
+========================
+echo "=== PHASE 1: Backup ==="
+mkdir -p "$BACKUP_DIR"
+echo "Backing up to: $BACKUP_DIR"
+
+Backup boot contents
+echo "Backing up /boot..."
+cp -rav /boot/* "$BACKUP_DIR/" 2>/dev/null || true
+
+Backup EFI if separate
+if mountpoint -q /boot/efi; then
+echo "Backing up /boot/efi..."
+mkdir -p "$BACKUP_DIR/efi_backup"
+cp -rav /boot/efi/* "$BACKUP_DIR/efi_backup/" 2>/dev/null || true
+fi
+
+Backup important configs
+echo "Backing up config files..."
+cp -v /etc/mkinitcpio.conf "$BACKUP_DIR/" 2>/dev/null || true
+cp -v /etc/default/grub "$BACKUP_DIR/" 2>/dev/null || true
+cp -v /etc/fstab "$BACKUP_DIR/" 2>/dev/null || true
+
+Verify backup
+echo "Backup contents:"
+ls -la "$BACKUP_DIR"
+echo "Backup completed successfully."
+
+========================
+WIPE AND PREPARE BOOT PARTITION
+========================
+echo
+echo "=== PHASE 2: Wipe and Prepare Boot Partition ==="
+
+Unmount partitions
+echo "Unmounting partitions..."
+umount /boot/efi 2>/dev/null || true
+umount /boot 2>/dev/null || true
+
+Wipe the partition completely
+echo "Wiping $BOOT_PART..."
+wipefs -a "$BOOT_PART"
+mkfs.vfat -F 32 -n SYSTEMD_BOOT "$BOOT_PART"
+
+Remount
+echo "Remounting partitions..."
+mount "$BOOT_PART" /boot
+mkdir -p /boot/efi
+mount "$BOOT_PART" /boot/efi 2>/dev/null || true
+
+Create directory structure
+echo "Creating directory structure..."
+mkdir -p /boot/loader/entries
+mkdir -p /boot/EFI/systemd
+mkdir -p /boot/EFI/BOOT
+
+Set permissions
+chmod 755 /boot /boot/efi /boot/loader /boot/EFI
+
+========================
+INSTALL systemd-boot AND KERNEL
+========================
+echo
+echo "=== PHASE 3: Install systemd-boot and Kernel ==="
+
+Install systemd-boot
+echo "Installing systemd-boot..."
+bootctl install --path=/boot
+
+Verify installation
+echo "systemd-boot status:"
+bootctl status
+
+Ensure kernel and initramfs tools are installed
+echo "Installing/updating kernel..."
+pacman -S --needed --noconfirm linux linux-headers linux-firmware
+
+Generate initramfs
+echo "Generating initramfs..."
+mkinitcpio -P
+
+========================
+CONFIGURE systemd-boot
+========================
+echo
+echo "=== PHASE 4: Configure systemd-boot ==="
+
+Create loader configuration
+cat > /boot/loader/loader.conf << 'EOF'
+default arch.conf
+timeout 3
+console-mode keep
+editor no
+auto-entries 1
+auto-firmware 1
+EOF
+
+Get current kernel version
+CURRENT_KERNEL=$(uname -r)
+
+Get root partition UUID
+ROOT_UUID=$(blkid -s UUID -o value "$ROOT_PART")
+
+Create main boot entry
+cat > /boot/loader/entries/arch.conf << EOF
+title Arch Linux
+linux /vmlinuz-linux
+initrd /initramfs-linux.img
+options root=UUID=$ROOT_UUID rw quiet
+EOF
+
+Create fallback entry
+cat > /boot/loader/entries/arch-fallback.conf << EOF
+title Arch Linux (fallback)
+linux /vmlinuz-linux
+initrd /initramfs-linux-fallback.img
+options root=UUID=$ROOT_UUID rw quiet
+EOF
+
+Copy kernel files
+echo "Copying kernel files..."
+cp -v /usr/lib/modules/$CURRENT_KERNEL/vmlinuz /boot/vmlinuz-linux
+cp -v /boot/initramfs-linux.img /boot/
+cp -v /boot/initramfs-linux-fallback.img /boot/ 2>/dev/null || true
+
+========================
+UEFI CONFIGURATION
+========================
+echo
+echo "=== PHASE 5: UEFI Configuration ==="
+
+Remove old boot entries
+echo "Cleaning up old UEFI entries..."
+OLD_ENTRIES=$(efibootmgr | grep -E '(Windows|ubuntu|linux|grub)' | awk '{print $1}' | tr -d 'Boot' | tr -d '*')
+for entry in $OLD_ENTRIES; do
+efibootmgr -b $entry -B 2>/dev/null || true
+done
+
+Create new systemd-boot UEFI entry
+echo "Creating new UEFI entry..."
+efibootmgr -c -d "${BOOT_PART%[0-9]}" -p "${BOOT_PART##*[a-z]}" -L "Arch Linux (systemd-boot)" -l '\EFI\systemd\systemd-bootx64.efi'
+
+Set as first boot option
+NEW_ENTRY=$(efibootmgr | grep "Arch Linux" | awk '{print $1}' | tr -d 'Boot')
+if [ -n "$NEW_ENTRY" ]; then
+efibootmgr -o "$NEW_ENTRY"
+fi
+
+Verify EFI setup
+echo "Current UEFI entries:"
+efibootmgr -v
+
+========================
+AUTOMATION AND HOOKS
+========================
+echo
+echo "=== PHASE 6: Automation Setup ==="
+
+Create pacman hook for automatic updates
+HOOK_DIR="/etc/pacman.d/hooks"
+mkdir -p "$HOOK_DIR"
+
+cat > "$HOOK_DIR/100-systemd-boot.hook" << 'EOF'
+[Trigger]
+Type = Package
+Operation = Upgrade
+Target = linux
+
+[Action]
+Description = Updating systemd-boot
+When = PostTransaction
+Exec = /usr/bin/bootctl update
+EOF
+
+Create kernel install script
+cat > /usr/local/bin/update-systemd-boot << 'EOF'
+#!/bin/bash
+
+Update kernel images in boot partition
+cp -f /usr/lib/modules/$2/vmlinuz /boot/vmlinuz-$2
+bootctl update
+EOF
+
+chmod +x /usr/local/bin/update-systemd-boot
+
+========================
+VERIFICATION
+========================
+echo
+echo "=== PHASE 7: Verification ==="
+
+echo "Boot directory contents:"
+ls -la /boot/
+
+echo "Loader entries:"
+ls -la /boot/loader/entries/
+cat /boot/loader/entries/*.conf
+
+echo "EFI directory contents:"
+ls -la /boot/EFI/systemd/
+
+echo "Final systemd-boot status:"
+bootctl status
+
+echo "Kernel files:"
+ls -la /boot/vmlinuz* /boot/initramfs*
+
+========================
+FINAL STEPS
+========================
+echo
+echo "=== PHASE 8: Final Steps ==="
+
+Update bootloader
+bootctl update
+
+Sync filesystem
+sync
+
+echo
+echo "=== INSTALLATION COMPLETE ==="
+echo "✅ systemd-boot has been installed successfully!"
+echo "✅ /boot partition has been completely cleaned"
+echo "✅ Backup created at: $BACKUP_DIR"
+echo
+echo "Next steps:"
+echo "1. Review the configuration above"
+echo "2. Reboot your system: 'reboot'"
+echo "3. Select 'Arch Linux' in the boot menu"
+echo
+echo "Emergency recovery:"
+echo "If system fails to boot, use Arch ISO to chroot and:"
+echo "- mount $ROOT_PART /mnt"
+echo "- mount $BOOT_PART /mnt/boot"
+echo "- arch-chroot /mnt"
+echo "- bootctl update"
+
+========================
+REBOOT PROMPT
+========================
+read -p "Reboot now? (y/N): " -n 1 -r
+echo
+if [[ $REPLY =~ ^[Yy]$ ]]; then
+echo "Rebooting in 5 seconds..."
+sleep 5
+reboot
+else
+echo "Manual reboot required when ready: 'reboot'"
+fi
+
+========================
+USAGE INSTRUCTIONS
+========================
+1. Edit BOOT_PART and ROOT_PART variables at the top
+2. Make script executable: chmod +x install-systemd-boot.sh
+3. Run as root: ./install-systemd-boot.sh
+4. Follow prompts and verify output
+5. Reboot when complete

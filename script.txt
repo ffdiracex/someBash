@@ -1,0 +1,195 @@
+#!/bin/bash
+set -euo pipefail
+IFS=$'\n\t'
+
+Configuration
+readonly BOOT_PART="/dev/sda1"
+readonly ROOT_PART="/dev/sda2"
+readonly BACKUP_DIR="/root/boot_backup_$(date +%Y%m%d_%H%M%S)"
+readonly LOG_FILE="/var/log/systemd-boot-install.log"
+
+Initialize logging
+exec > >(tee -a "${LOG_FILE}") 2>&1
+
+panic() {
+echo "FATAL: $1" >&2
+exit 1
+}
+
+validate_prerequisites() {
+[[ $EUID -eq 0 ]] || panic "Must be run as root"
+command -v pacman >/dev/null 2>&1 || panic "Arch Linux required"
+[[ -b "$BOOT_PART" ]] || panic "Boot partition $BOOT_PART not found"
+[[ -b "$ROOT_PART" ]] || panic "Root partition $ROOT_PART not found"
+}
+
+backup_system() {
+echo "Creating backup in $BACKUP_DIR"
+mkdir -p "$BACKUP_DIR"
+
+cp -rav /boot/* "$BACKUP_DIR/" 2>/dev/null || true
+mountpoint -q /boot/efi && {
+    mkdir -p "$BACKUP_DIR/efi_backup"
+    cp -rav /boot/efi/* "$BACKUP_DIR/efi_backup/" 2>/dev/null || true
+}
+
+local config_files=(
+    /etc/mkinitcpio.conf
+    /etc/default/grub
+    /etc/fstab
+    /boot/loader/loader.conf
+    /boot/loader/entries/*.conf
+)
+
+for config in "${config_files[@]}"; do
+    [[ -f "$config" ]] && cp -v "$config" "$BACKUP_DIR/" 2>/dev/null || true
+done
+
+
+wipe_boot_partition() {
+echo "Unmounting boot partitions"
+umount /boot/efi 2>/dev/null || true
+umount /boot 2>/dev/null || true
+
+echo "Wiping $BOOT_PART"
+wipefs -a "$BOOT_PART"
+mkfs.vfat -F 32 -n SYSTEMD_BOOT "$BOOT_PART"
+
+echo "Remounting boot partition"
+mount "$BOOT_PART" /boot
+mkdir -p /boot/efi
+mount "$BOOT_PART" /boot/efi 2>/dev/null || true
+
+create_directory_structure() {
+local directories=(
+/boot/loader/entries
+/boot/EFI/systemd
+/boot/EFI/BOOT
+
+for dir in "${directories[@]}"; do
+    mkdir -p "$dir"
+    chmod 755 "$dir"
+done
+
+install_systemd_boot() {
+echo "Installing systemd-boot"
+bootctl install --path=/boot --no-variables
+
+echo "Ensuring kernel packages are installed"
+pacman -S --needed --noconfirm linux linux-headers linux-firmware >/dev/null 2>&1
+
+echo "Generating initramfs"
+mkinitcpio -P
+
+configure_boot_entries() {
+local root_uuid=$(blkid -s UUID -o value "$ROOT_PART")
+local current_kernel=$(uname -r)
+
+cat > /boot/loader/loader.conf << EOF
+default arch.conf
+timeout 3
+console-mode keep
+editor no
+auto-entries 1
+auto-firmware 1
+EOF
+
+cat > /boot/loader/entries/arch.conf << EOF
+
+title Arch Linux
+linux /vmlinuz-linux
+initrd /initramfs-linux.img
+options root=UUID=$root_uuid rw quiet
+EOF
+
+cat > /boot/loader/entries/arch-fallback.conf << EOF
+title Arch Linux (fallback)
+linux /vmlinuz-linux
+initrd /initramfs-linux-fallback.img
+options root=UUID=$root_uuid rw quiet
+EOF
+
+cp -f "/usr/lib/modules/$current_kernel/vmlinuz" "/boot/vmlinuz-linux"
+cp -f "/boot/initramfs-linux.img" "/boot/"
+[[ -f "/boot/initramfs-linux-fallback.img" ]] && cp -f "/boot/initramfs-linux-fallback.img" "/boot/"
+
+configure_uefi() {
+echo "Configuring UEFI entries"
+local old_entries=$(efibootmgr | grep -E '(Windows|ubuntu|linux|grub)' | awk '{print $1}' | tr -d 'Boot' | tr -d '*')
+
+for entry in $old_entries; do
+    efibootmgr -b "$entry" -B 2>/dev/null || true
+done
+
+local disk="${BOOT_PART%[0-9]}"
+local part_num="${BOOT_PART##*[a-z]}"
+
+efibootmgr -c -d "$disk" -p "$part_num" -L "Arch Linux (systemd-boot)" -l '\EFI\systemd\systemd-bootx64.efi' >/dev/null 2>&1
+
+local new_entry=$(efibootmgr | grep "Arch Linux" | awk '{print $1}' | tr -d 'Boot')
+[[ -n "$new_entry" ]] && efibootmgr -o "$new_entry" >/dev/null 2>&1
+
+setup_automation() {
+local hook_dir="/etc/pacman.d/hooks"
+mkdir -p "$hook_dir"
+
+cat > "$hook_dir/100-systemd-boot.hook" << 'EOF'
+[Trigger]
+Type = Package
+Operation = Upgrade
+Target = linux
+
+[Action]
+Description = Updating systemd-boot
+When = PostTransaction
+Exec = /usr/bin/bootctl update
+EOF
+
+
+cat > /usr/local/bin/update-systemd-boot << 'EOF'
+#!/bin/bash
+cp -f "/usr/lib/modules/$2/vmlinuz" "/boot/vmlinuz-$2"
+bootctl update
+EOF
+
+chmod +x /usr/local/bin/update-systemd-boot
+verify_installation() {
+echo "Verifying installation"
+
+local required_files=(
+    "/boot/EFI/systemd/systemd-bootx64.efi"
+    "/boot/loader/loader.conf"
+    "/boot/loader/entries/arch.conf"
+    "/boot/vmlinuz-linux"
+    "/boot/initramfs-linux.img"
+)
+
+for file in "${required_files[@]}"; do
+    [[ -f "$file" ]] || panic "Missing required file: $file"
+done
+
+bootctl status >/dev/null 2>&1 || panic "systemd-boot status check failed"
+efibootmgr -v | grep -q "systemd-boot" || panic "UEFI entry not created"
+
+finalize() {
+bootctl update
+sync
+
+echo "Installation completed successfully"
+echo "Backup created at: $BACKUP_DIR"
+echo "Log file: $LOG_FILE"
+
+main() {
+validate_prerequisites
+backup_system
+wipe_boot_partition
+create_directory_structure
+install_systemd_boot
+configure_boot_entries
+configure_uefi
+setup_automation
+verify_installation
+finalize
+}
+
+main "$@"

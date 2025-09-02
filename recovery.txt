@@ -1,0 +1,278 @@
+#!/bin/bash
+set -euo pipefail
+IFS=$'\n\t'
+
+Configuration - USER MUST VERIFY THESE
+readonly BOOT_PART="/dev/sda1" # VERIFY WITH: lsblk -f
+readonly ROOT_PART="/dev/sda2" # VERIFY WITH: lsblk -f
+readonly BACKUP_DIR="/root/boot_backup_$(date +%Y%m%d_%H%M%S)"
+readonly LOG_FILE="/var/log/systemd-boot-install.log"
+
+Emergency recovery variables
+readonly RECOVERY_SCRIPT="/root/recover-boot.sh"
+readonly SNAPSHOT_DIR="/root/pre-install-snapshot"
+
+Initialize logging
+exec > >(tee -a "${LOG_FILE}") 2>&1
+
+panic() {
+echo "FATAL: $1" >&2
+echo "Emergency recovery script created: $RECOVERY_SCRIPT"
+create_recovery_script
+exit 1
+}
+
+create_recovery_script() {
+cat > "$RECOVERY_SCRIPT" << 'EOF'
+#!/bin/bash
+set -euo pipefail
+
+echo "=== EMERGENCY BOOT RECOVERY ==="
+echo "This script will attempt to recover your system using the backup at: $BACKUP_DIR"
+
+Check if we're in chroot
+if [[ ! -d /proc/1/root ]]; then
+echo "NOTICE: This should be run from a live USB environment"
+echo "Mount your partitions first:"
+echo " mount $ROOT_PART /mnt"
+echo " mount $BOOT_PART /mnt/boot"
+echo " arch-chroot /mnt /bin/bash -c '$RECOVERY_SCRIPT'"
+exit 1
+fi
+
+Restore from backup
+if [[ -d "$BACKUP_DIR" ]]; then
+echo "Restoring boot partition from backup..."
+cp -rav "$BACKUP_DIR"/* /boot/ 2>/dev/null || true
+
+# Reinstall GRUB as fallback
+if command -v grub-install >/dev/null 2>&1; then
+    echo "Reinstalling GRUB as fallback..."
+    grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB
+    grub-mkconfig -o /boot/grub/grub.cfg
+fi
+
+# Reinstall systemd-boot
+if command -v bootctl >/dev/null 2>&1; then
+    echo "Reinstalling systemd-boot..."
+    bootctl install --path=/boot
+fi
+
+echo "Recovery complete. Please reboot."
+
+else
+echo "NO BACKUP FOUND! Manual recovery required."
+echo "1. pacman -S linux linux-headers"
+echo "2. mkinitcpio -P"
+echo "3. bootctl install --path=/boot"
+fi
+EOF
+chmod +x "$RECOVERY_SCRIPT"
+}
+
+create_pre_install_snapshot() {
+echo "Creating pre-installation snapshot..."
+mkdir -p "$SNAPSHOT_DIR"
+
+
+# System information
+lsblk > "$SNAPSHOT_DIR/lsblk.txt"
+df -h > "$SNAPSHOT_DIR/df.txt"
+efibootmgr -v > "$SNAPSHOT_DIR/efibootmgr.txt"
+uname -r > "$SNAPSHOT_DIR/kernel-version.txt"
+pacman -Q linux linux-headers > "$SNAPSHOT_DIR/linux-packages.txt" 2>/dev/null || true
+
+# Boot partition contents
+find /boot -type f -exec ls -la {} \; > "$SNAPSHOT_DIR/boot-files.txt" 2>/dev/null || true
+}
+
+validate_prerequisites() {
+[[ $EUID -eq 0 ]] || panic "Must be run as root"
+command -v pacman >/dev/null 2>&1 || panic "Arch Linux required"
+command -v bootctl >/dev/null 2>&1 || panic "systemd-boot not installed"
+
+
+# Verify partitions exist
+[[ -b "$BOOT_PART" ]] || panic "Boot partition $BOOT_PART not found - check with: lsblk"
+[[ -b "$ROOT_PART" ]] || panic "Root partition $ROOT_PART not found - check with: lsblk"
+
+# Verify partitions are correct type
+local boot_type=$(blkid -s TYPE -o value "$BOOT_PART")
+[[ "$boot_type" == "vfat" ]] || echo "WARNING: Boot partition is not vfat (found: $boot_type)"
+
+# Check disk space
+local boot_space=$(df --output=avail "$BOOT_PART" | tail -1)
+[[ $boot_space -lt 50000 ]] && panic "Insufficient space on boot partition (need 50MB, have ${boot_space}KB)"
+
+# Check if system is UEFI
+[[ -d /sys/firmware/efi ]] || panic "System must be UEFI for systemd-boot"
+}
+
+check_critical_processes() {
+# Ensure no critical processes are using /boot
+local boot_users=$(lsof /boot 2>/dev/null | grep -v COMMAND | awk '{print $1}' | sort -u)
+if [[ -n "$boot_users" ]]; then
+echo "WARNING: Processes using /boot: $boot_users"
+echo "Consider stopping these services before continuing"
+read -p "Continue anyway? (y/N): " -n 1 -r
+[[ $REPLY =~ ^[Yy]$ ]] || panic "Aborted by user"
+fi
+}
+
+backup_system() {
+echo "Creating comprehensive backup in $BACKUP_DIR"
+mkdir -p "$BACKUP_DIR"
+
+
+# Create backup manifest
+find /boot -type f > "$BACKUP_DIR/backup-manifest.txt" 2>/dev/null || true
+
+# Backup with progress
+local boot_files=$(find /boot -type f 2>/dev/null | wc -l)
+echo "Backing up $boot_files files from /boot..."
+
+cp -rav /boot/* "$BACKUP_DIR/" 2>/dev/null | while read line; do
+    echo "BACKUP: $line"
+done
+
+# Verify backup integrity
+local backed_up_files=$(find "$BACKUP_DIR" -type f 2>/dev/null | wc -l)
+[[ $backed_up_files -eq 0 ]] && panic "Backup failed - no files copied"
+
+echo "Backup completed: $backed_up_files files saved"
+}
+
+wipe_boot_partition() {
+echo "Unmounting boot partitions"
+
+# Graceful unmount with retries
+local attempts=3
+for ((i=1; i<=attempts; i++)); do
+    umount /boot/efi 2>/dev/null || true
+    umount /boot 2>/dev/null || true
+    
+    if ! mountpoint -q /boot && ! mountpoint -q /boot/efi; then
+        break
+    fi
+    
+    [[ $i -eq $attempts ]] && panic "Failed to unmount boot partitions"
+    echo "Retrying unmount... ($i/$attempts)"
+    sleep 2
+done
+
+echo "Wiping $BOOT_PART"
+wipefs -a "$BOOT_PART"
+mkfs.vfat -F 32 -n SYSTEMD_BOOT "$BOOT_PART"
+
+echo "Remounting boot partition"
+mount "$BOOT_PART" /boot || panic "Failed to mount boot partition"
+mkdir -p /boot/efi
+mount "$BOOT_PART" /boot/efi 2>/dev/null || true
+}
+
+install_systemd_boot() {
+echo "Installing systemd-boot"
+
+
+# Check if systemd-boot is available
+if ! bootctl status >/dev/null 2>&1; then
+    pacman -S --needed --noconfirm systemd >/dev/null 2>&1 || panic "Failed to install systemd"
+fi
+
+bootctl install --path=/boot --no-variables || panic "systemd-boot installation failed"
+
+# Verify installation
+[[ -f /boot/EFI/systemd/systemd-bootx64.efi ]] || panic "systemd-boot EFI file not found"
+}
+
+configure_boot_entries() {
+local root_uuid=$(blkid -s UUID -o value "$ROOT_PART" 2>/dev/null)
+[[ -z "$root_uuid" ]] && panic "Could not determine root partition UUID"
+
+# Test kernel availability
+local current_kernel=$(uname -r)
+[[ -f "/usr/lib/modules/$current_kernel/vmlinuz" ]] || panic "Kernel vmlinuz not found"
+[[ -f "/boot/initramfs-linux.img" ]] || panic "initramfs not found"
+
+cat > /boot/loader/loader.conf << EOF
+default arch.conf
+timeout 3
+console-mode keep
+editor no
+auto-entries 1
+auto-firmware 1
+EOF
+
+
+cat > /boot/loader/entries/arch.conf << EOF
+title Arch Linux
+linux /vmlinuz-linux
+initrd /initramfs-linux.img
+options root=UUID=$root_uuid rw quiet
+EOF
+
+
+# Copy kernel files with verification
+cp -f "/usr/lib/modules/$current_kernel/vmlinuz" "/boot/vmlinuz-linux" || panic "Failed to copy kernel"
+cp -f "/boot/initramfs-linux.img" "/boot/" || panic "Failed to copy initramfs"
+
+[[ -f "/boot/initramfs-linux-fallback.img" ]] && \
+    cp -f "/boot/initramfs-linux-fallback.img" "/boot/" || \
+    echo "WARNING: Fallback initramfs not available"
+}
+
+final_verification() {
+echo "Performing final verification"
+
+# Check all critical files exist
+local critical_files=(
+    "/boot/EFI/systemd/systemd-bootx64.efi"
+    "/boot/loader/loader.conf"
+    "/boot/loader/entries/arch.conf"
+    "/boot/vmlinuz-linux"
+    "/boot/initramfs-linux.img"
+)
+
+for file in "${critical_files[@]}"; do
+    [[ -f "$file" ]] || panic "Critical file missing: $file"
+done
+
+# Verify file sizes are reasonable
+[[ $(stat -c%s "/boot/vmlinuz-linux") -gt 10000000 ]] || panic "Kernel file seems too small"
+[[ $(stat -c%s "/boot/initramfs-linux.img") -gt 10000000 ]] || panic "Initramfs seems too small"
+
+# Test bootloader functionality
+bootctl status >/dev/null 2>&1 || panic "systemd-boot status check failed"
+
+echo "VERIFICATION PASSED: All critical files present and valid"
+}
+
+main() {
+echo "=== SYSTEMD-BOOT INSTALLATION WITH SAFETY CHECKS ==="
+echo "This script will DESTROY all data on $BOOT_PART"
+echo "Emergency recovery script will be created: $RECOVERY_SCRIPT"
+echo
+
+read -p "Are you ABSOLUTELY sure? (type 'YES' to continue): " confirmation
+[[ "$confirmation" == "YES" ]] || panic "Aborted by user"
+
+create_pre_install_snapshot
+validate_prerequisites
+check_critical_processes
+backup_system
+create_recovery_script
+wipe_boot_partition
+install_systemd_boot
+configure_boot_entries
+final_verification
+
+echo "=== INSTALLATION SUCCESSFUL ==="
+echo "Backup: $BACKUP_DIR"
+echo "Log: $LOG_FILE"
+echo "Recovery script: $RECOVERY_SCRIPT"
+echo "Snapshot: $SNAPSHOT_DIR"
+echo
+echo "Reboot when ready. If boot fails, use the recovery script."
+}
+
+main "$@"
